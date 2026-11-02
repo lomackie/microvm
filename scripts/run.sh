@@ -8,4 +8,7 @@ DIR="${MICROVM_DIR:-microvm}"
 
 cd "$(dirname "$0")/.."
 rsync -az --delete --exclude target/ --exclude .git/ ./ "$HOST:$DIR/"
-ssh "$HOST" "cd $DIR && cargo run --release -q -p vmm -- $*"
+# -t gives the remote side a real terminal, so the guest console is interactive.
+TTY=()
+[ -t 0 ] && TTY=(-t)
+ssh "${TTY[@]}" "$HOST" "cd $DIR && cargo run --release -q -p vmm -- $*"

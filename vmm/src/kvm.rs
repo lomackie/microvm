@@ -20,6 +20,7 @@ pub const KVM_CREATE_VCPU: u64 = 0xAE41;
 pub const KVM_SET_USER_MEMORY_REGION: u64 = 0x4020_AE46; // _IOW, 32-byte struct
 pub const KVM_SET_TSS_ADDR: u64 = 0xAE47;
 pub const KVM_CREATE_IRQCHIP: u64 = 0xAE60;
+pub const KVM_IRQ_LINE: u64 = 0x4008_AE61; // _IOW, 8-byte struct
 pub const KVM_CREATE_PIT2: u64 = 0x4040_AE77; // _IOW, 64-byte struct
 pub const KVM_RUN: u64 = 0xAE80;
 pub const KVM_SET_MSRS: u64 = 0x4008_AE89; // _IOW, 8-byte header (kvm_msrs)
@@ -169,6 +170,14 @@ pub struct KvmMsrEntry {
     pub index: u32,
     pub reserved: u32,
     pub data: u64,
+}
+
+/// Set an interrupt line on KVM's in-kernel interrupt controllers high (1) or low (0).
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct KvmIrqLevel {
+    pub irq: u32,
+    pub level: u32,
 }
 
 /// Configuration for KVM's in-kernel PIT (the legacy PC timer chip).

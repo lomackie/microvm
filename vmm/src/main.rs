@@ -7,11 +7,18 @@
 //!   4. create a vCPU already in 64-bit mode, pointed at the kernel's entry point
 //!   5. run it: every time the guest touches hardware we emulate, KVM_RUN returns to us
 //!
-//! Usage: vmm --kernel <vmlinux> [--mem-mib N] [--cmdline "..."] [--debug] [--break <addr>]
+//! Devices: a 16550A serial console (I/O ports 0x3f8-0x3ff, IRQ 4) and, with --disk, a
+//! virtio-blk disk (MMIO page at 0xd0000000, IRQ 5) that the guest mounts as its root filesystem.
+//!
+//! Usage: vmm --kernel <vmlinux> [--disk <image>] [--mem-mib N] [--cmdline "..."]
+//!            [--debug] [--break <addr>]
 
 mod boot;
+mod irq;
 mod kvm;
 mod serial;
+mod terminal;
+mod virtio;
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -19,11 +26,14 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kvm::*;
+use irq::IrqLine;
 use serial::Serial;
+use virtio::block::Block;
+use virtio::MmioTransport;
 
 const DEFAULT_MEM_MIB: usize = 256;
 /// console=ttyS0: log to our serial port. reboot=t: reboot via triple fault, which reaches us as
@@ -32,12 +42,19 @@ const DEFAULT_MEM_MIB: usize = 256;
 const DEFAULT_CMDLINE: &str = "console=ttyS0 earlyprintk=serial reboot=t panic=-1 pci=off";
 /// COM1. The UART occupies 8 consecutive ports from here.
 const COM1: u16 = 0x3f8;
+const COM1_IRQ: u32 = 4;
+/// Where the virtio-blk register page lives in guest physical memory: well above RAM, in the
+/// region a PC leaves for devices. No memslot covers it, so every access is an MMIO exit to us.
+const VIRTIO_BLK_MMIO: u64 = 0xd000_0000;
+const VIRTIO_MMIO_SIZE: u64 = 0x1000;
+const VIRTIO_BLK_IRQ: u32 = 5;
 /// Intel VT-x needs KVM to reserve 3 pages of guest-physical space for its own use. Put them
 /// near the top of the 32-bit address space, far away from guest RAM.
 const KVM_TSS_ADDR: u64 = 0xfffb_d000;
 
 struct Args {
     kernel: String,
+    disk: Option<String>,
     mem_mib: usize,
     cmdline: String,
     /// Report where the guest is executing when it stops exiting for a while.
@@ -47,12 +64,13 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut args = Args { kernel: String::new(), mem_mib: DEFAULT_MEM_MIB, cmdline: DEFAULT_CMDLINE.into(), debug: false, break_at: None };
+    let mut args = Args { kernel: String::new(), disk: None, mem_mib: DEFAULT_MEM_MIB, cmdline: DEFAULT_CMDLINE.into(), debug: false, break_at: None };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
             "--kernel" => args.kernel = value()?,
+            "--disk" => args.disk = Some(value()?),
             "--mem-mib" => args.mem_mib = value()?.parse().map_err(|e| format!("--mem-mib: {e}"))?,
             "--cmdline" => args.cmdline = value()?,
             "--debug" => args.debug = true,
@@ -65,7 +83,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     if args.kernel.is_empty() {
-        return Err("usage: vmm --kernel <vmlinux> [--mem-mib N] [--cmdline \"...\"] [--debug] [--break <addr>]".into());
+        return Err("usage: vmm --kernel <vmlinux> [--disk <image>] [--mem-mib N] [--cmdline \"...\"] [--debug] [--break <addr>]".into());
     }
     if args.mem_mib < 32 || args.mem_mib > 1024 {
         // The boot page tables identity-map 1 GiB; enough for now.
@@ -79,7 +97,9 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(2);
     });
-    if let Err(e) = run(args) {
+    let result = run(args);
+    terminal::restore();
+    if let Err(e) = result {
         eprintln!("[vmm] error: {e}");
         std::process::exit(1);
     }
@@ -113,10 +133,26 @@ fn run(args: Args) -> io::Result<()> {
     };
     ioctl(vm.as_raw_fd(), KVM_SET_USER_MEMORY_REGION, &region as *const _ as u64)?;
 
+    // Devices. The disk is optional; without one the kernel stops at "no root filesystem".
+    let mut cmdline = args.cmdline.clone();
+    let mut disk = match &args.disk {
+        Some(path) => {
+            let file = OpenOptions::new().read(true).write(true).open(path).map_err(with_path(path))?;
+            // Tell the kernel where the device is (size@address:irq), and to use it as root.
+            cmdline += &format!(
+                " virtio_mmio.device={}K@{VIRTIO_BLK_MMIO:#x}:{VIRTIO_BLK_IRQ} root=/dev/vda rw",
+                VIRTIO_MMIO_SIZE / 1024
+            );
+            Some(MmioTransport::new(Block::new(file)?, IrqLine::new(vm.as_raw_fd(), VIRTIO_BLK_IRQ)))
+        }
+        None => None,
+    };
+    let serial = Arc::new(Mutex::new(Serial::new(io::stdout(), IrqLine::new(vm.as_raw_fd(), COM1_IRQ))));
+
     // 3. Firmware + bootloader duties.
-    let image = fs::read(&args.kernel).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", args.kernel)))?;
+    let image = fs::read(&args.kernel).map_err(with_path(&args.kernel))?;
     let entry = boot::load_kernel(mem, &image)?;
-    boot::write_boot_params(mem, &args.cmdline)?;
+    boot::write_boot_params(mem, &cmdline)?;
     drop(image);
 
     // 4. vCPU 0: tell it which CPU features it has, and start it in 64-bit mode at the kernel.
@@ -154,8 +190,9 @@ fn run(args: Args) -> io::Result<()> {
     let run_ptr = mmap(Some(vcpu.as_raw_fd()), run_size, libc::MAP_SHARED)?;
     let run = run_ptr as *mut KvmRun;
 
-    // 5. The run loop.
-    let mut serial = Serial::new(io::stdout());
+    // 5. The run loop. Keystrokes arrive on another thread, which feeds the serial port.
+    terminal::enter_raw_mode()?;
+    terminal::spawn_input_thread(serial.clone());
     let mut exits: HashMap<String, u64> = HashMap::new();
     let mut first_output: Option<Duration> = None;
     eprintln!("[vmm] booting {} with {} MiB RAM, entry {entry:#x}", args.kernel, args.mem_mib);
@@ -194,6 +231,7 @@ fn run(args: Args) -> io::Result<()> {
                 match io_exit.port {
                     p if (COM1..COM1 + 8).contains(&p) => {
                         let offset = (p - COM1) as u8;
+                        let mut serial = serial.lock().unwrap();
                         for byte in data.iter_mut() {
                             if is_out {
                                 serial.write(offset, *byte)?;
@@ -212,16 +250,26 @@ fn run(args: Args) -> io::Result<()> {
                 }
             }
             KVM_EXIT_MMIO => {
-                // No MMIO devices yet. Like empty ports: reads return all ones, writes vanish.
                 let mmio = unsafe { &mut (*run).exit.mmio };
-                let label = format!("mmio {} {:#x}", if mmio.is_write != 0 { "write" } else { "read" }, mmio.phys_addr);
-                *exits.entry(label).or_default() += 1;
-                if mmio.is_write == 0 {
-                    mmio.data = [0xff; 8];
+                let is_write = mmio.is_write != 0;
+                let len = (mmio.len as usize).min(8);
+                *exits.entry(mmio_exit_label(mmio.phys_addr, is_write)).or_default() += 1;
+                match disk.as_mut() {
+                    Some(blk) if (VIRTIO_BLK_MMIO..VIRTIO_BLK_MMIO + VIRTIO_MMIO_SIZE).contains(&mmio.phys_addr) => {
+                        let offset = mmio.phys_addr - VIRTIO_BLK_MMIO;
+                        if is_write {
+                            blk.write(offset, &mmio.data[..len], mem)?;
+                        } else {
+                            blk.read(offset, &mut mmio.data[..len]);
+                        }
+                    }
+                    // Nothing mapped here. Like empty ports: reads return all ones, writes vanish.
+                    _ if !is_write => mmio.data = [0xff; 8],
+                    _ => {}
                 }
             }
             KVM_EXIT_DEBUG => {
-                serial.flush()?;
+                serial.lock().unwrap().flush()?;
                 dump_guest_state(&vcpu, mem, "breakpoint hit")?;
                 print_summary(start.elapsed(), first_output, &exits);
                 return Ok(());
@@ -230,7 +278,7 @@ fn run(args: Args) -> io::Result<()> {
                 // The guest reset the machine (with reboot=t, that's how Linux reboots or ends
                 // a panic). We treat "reboot" as "the VM is done".
                 *exits.entry("shutdown".into()).or_default() += 1;
-                serial.flush()?;
+                serial.lock().unwrap().flush()?;
                 print_summary(start.elapsed(), first_output, &exits);
                 return Ok(());
             }
@@ -238,7 +286,7 @@ fn run(args: Args) -> io::Result<()> {
                 // With KVM's in-kernel interrupt controller, an idle guest's `hlt` is handled
                 // inside KVM (the vCPU sleeps until an interrupt). We only see this if the guest
                 // halted with interrupts off, i.e. it stopped for good.
-                serial.flush()?;
+                serial.lock().unwrap().flush()?;
                 print_summary(start.elapsed(), first_output, &exits);
                 return Err(io::Error::other("guest halted with interrupts disabled"));
             }
@@ -342,6 +390,11 @@ fn guest_virt_to_phys(mem: &[u8], cr3: u64, virt: u64) -> Option<usize> {
     None
 }
 
+/// Prefix an I/O error with the file path it concerns.
+fn with_path(path: &str) -> impl FnOnce(io::Error) -> io::Error + '_ {
+    move |e| io::Error::new(e.kind(), format!("{path}: {e}"))
+}
+
 /// mmap read/write memory: anonymous (guest RAM) or backed by an fd (the vCPU's kvm_run page).
 fn mmap(fd: Option<i32>, size: usize, flags: i32) -> io::Result<*mut u8> {
     let addr = unsafe {
@@ -351,6 +404,23 @@ fn mmap(fd: Option<i32>, size: usize, flags: i32) -> io::Result<*mut u8> {
         return Err(io::Error::last_os_error());
     }
     Ok(addr as *mut u8)
+}
+
+/// Human-readable name for an MMIO exit, for the summary.
+fn mmio_exit_label(addr: u64, is_write: bool) -> String {
+    let dir = if is_write { "write" } else { "read " };
+    if !(VIRTIO_BLK_MMIO..VIRTIO_BLK_MMIO + VIRTIO_MMIO_SIZE).contains(&addr) {
+        return format!("mmio {dir} {addr:#x} (nothing there)");
+    }
+    let register = match addr - VIRTIO_BLK_MMIO {
+        0x050 => "QueueNotify (doorbell)",
+        0x060 => "InterruptStatus",
+        0x064 => "InterruptACK",
+        0x070 => "Status",
+        o if o >= 0x100 => "config space",
+        _ => "setup registers",
+    };
+    format!("mmio {dir} virtio-blk {register}")
 }
 
 /// Human-readable name for an I/O port exit, for the summary.
